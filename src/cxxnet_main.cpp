@@ -4,15 +4,25 @@
 #include <ctime>
 #include <string>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <vector>
 #include <climits>
+#include <dmlc/io.h>
+#include <dmlc/logging.h>
 #include "nnet/nnet.h"
 #include "io/data.h"
 #include "utils/config.h"
 
-namespace cxxnet{
+#if MSHADOW_DIST_PS
+#include "ps.h"
+#endif
 
+#if MSHADOW_RABIT_PS
+#include <rabit.h>
+#endif
 
+namespace cxxnet {
 class CXXNetLearnTask {
  public:
   CXXNetLearnTask(void) {
@@ -34,6 +44,9 @@ class CXXNetLearnTask {
     reset_net_type = -1;
     extract_node_name = "";
     output_format = 1;
+    weight_name = "wmat";
+    extract_layer_name = "";
+    weight_filename = "";
 #if MSHADOW_USE_CUDA
     this->SetParam("dev", "gpu");
 #else
@@ -46,7 +59,6 @@ class CXXNetLearnTask {
       // shut down tensor engine if it is GPU based
       //if (device == "gpu") mshadow::ShutdownTensorEngine();
     }
-
     if (itr_train != NULL)   delete itr_train;
     if (itr_pred  != NULL)   delete itr_pred;
     for (size_t i = 0; i < itr_evals.size(); ++ i) {
@@ -59,11 +71,35 @@ class CXXNetLearnTask {
       printf("Usage: <config>\n");
       return 0;
     }
-
-    utils::ConfigIterator itr(argv[1]);
-    while (itr.Next()) {
-      this->SetParam(itr.name(), itr.val());
+#if MSHADOW_RABIT_PS
+    rabit::Init(argc, argv);
+    if (rabit::GetRank() != 0) {
+      this->SetParam("silent", "1");
     }
+    if (rabit::IsDistributed()) {
+      this->SetParam("param_server", "local");
+    }
+    {
+      std::ostringstream os;
+      os << rabit::GetRank();
+      this->SetParam("dist_worker_rank", os.str().c_str());
+    }
+    {
+      std::ostringstream os;
+      os << rabit::GetWorldSize();
+      this->SetParam("dist_num_worker", os.str().c_str());
+    }
+#endif
+    dmlc::Stream *cfg = dmlc::Stream::Create(argv[1], "r");
+    {
+      dmlc::istream is(cfg);
+      utils::ConfigStreamReader itr(is);
+      itr.Init();
+      while (itr.Next()) {
+        this->SetParam(itr.name(), itr.val());
+      }
+    }
+    delete cfg;
     for (int i = 2; i < argc; i ++) {
       char name[256], val[256];
       if (sscanf(argv[i], "%[^=]=%s", name, val) == 2) {
@@ -72,11 +108,15 @@ class CXXNetLearnTask {
     }
     this->Init();
     if (!silent) {
-      printf("initializing end, start working\n");
+      utils::TrackerPrint("initializing end, start working\n");
     }
     if (task == "train" || task == "finetune") this->TaskTrain();
     if (task == "pred")   this->TaskPredict();
     if (task == "extract") this->TaskExtractFeature();
+    if (task == "get_weight") this->TaskGetWeight();
+#if MSHADOW_RABIT_PS
+    rabit::Finalize();
+#endif
     return 0;
   }
 
@@ -92,11 +132,16 @@ class CXXNetLearnTask {
     if (!strcmp(name,"model_dir"))          name_model_dir= val;
     if (!strcmp(name,"num_round" ))         num_round     = atoi(val);
     if (!strcmp(name,"max_round"))           max_round = atoi(val);
-    if (!strcmp(name, "silent"))            silent        = atoi(val);
-    if (!strcmp(name, "task"))              task = val;
-    if (!strcmp(name, "dev"))               device = val;
+    if (!strcmp(name, "silent"))             silent        = atoi(val);
+    if (!strcmp(name, "task"))  task = val;
+    if (!strcmp(name, "dev")) {
+      device = val;
+      if (!strcmp(val, "gpu:rank")) return;
+    }
     if (!strcmp(name, "test_io"))           test_io = atoi(val);
     if (!strcmp(name, "extract_node_name"))         extract_node_name = val;
+    if (!strcmp(name, "extract_layer_name"))         extract_layer_name = val;
+    if (!strcmp(name, "weight_filename"))         weight_filename = val;
     if (!strcmp(name, "output_format")) {
       if  (!strcmp(val, "txt")) output_format = 1;
       else output_format = 0;
@@ -118,7 +163,7 @@ class CXXNetLearnTask {
     }
     continue_training = 0;
     if (name_model_in == "NULL") {
-      utils::Assert(task == "train", "must specify model_in if not training");
+      CHECK(task == "train") << "must specify model_in if not training";
       net_trainer = this->CreateNet();
       net_trainer->InitModel();
     } else {
@@ -128,30 +173,30 @@ class CXXNetLearnTask {
         this->LoadModel();
       }
     }
-  
+
     this->CreateIterators();
   }
   // load in latest model from model_folder
   inline int SyncLastestModel(void) {
-    FILE *fi = NULL, *last = NULL;
-    char name[ 256 ];
+    dmlc::Stream *fi = NULL, *last = NULL;
     int s_counter = start_counter;
     do{
-      if (last != NULL) fclose(last);
+      if (last != NULL) delete last;
       last = fi;
-      sprintf(name,"%s/%04d.model", name_model_dir.c_str(), s_counter ++);
-      fi = fopen64(name, "rb");
-    }while (fi != NULL);
+      std::ostringstream os;
+      os << name_model_dir << '/' << std::setfill('0')
+         << std::setw(4) << s_counter++ << ".model";
+      fi = dmlc::Stream::Create(os.str().c_str(), "r", true);
+    } while (fi != NULL);
 
     if (last != NULL) {
-      utils::Assert(fread(&net_type, sizeof(int), 1, last) > 0, "loading model");
+      CHECK(last->Read(&net_type, sizeof(int)) != 0) << "invalid model format";
       net_trainer = this->CreateNet();
-      utils::FileStream fs(last);
-      net_trainer->LoadModel(fs);
+      net_trainer->LoadModel(*last);
       start_counter = s_counter - 1;
-      fclose(last);
+      delete last;
       return 1;
-    }else{
+    } else {
       return 0;
     }
   }
@@ -161,12 +206,11 @@ class CXXNetLearnTask {
     if (pos != NULL && sscanf(pos + 1, "%d", &start_counter) != 1){
       printf("WARNING: Cannot infer start_counter from model name. Specify it in config if needed\n");
     }
-    FILE *fi = utils::FopenCheck(name_model_in.c_str(), "rb");
-    utils::Assert(fread(&net_type, sizeof(int), 1, fi) > 0, "loading model");
+    dmlc::Stream *fi = dmlc::Stream::Create(name_model_in.c_str(), "r");
+    CHECK(fi->Read(&net_type, sizeof(int)) != 0) << "invalid model format";
     net_trainer = this->CreateNet();
-    utils::FileStream fs(fi);
-    net_trainer->LoadModel(fs);
-    fclose(fi);
+    net_trainer->LoadModel(*fi);
+    delete fi;
     ++start_counter;
   }
   // save model into file
@@ -174,18 +218,26 @@ class CXXNetLearnTask {
     char name[256];
     sprintf(name,"%s/%04d.model" , name_model_dir.c_str(), start_counter ++);
     if (save_period == 0 || start_counter % save_period != 0) return;
-    FILE *fo  = utils::FopenCheck(name, "wb");
-    fwrite(&net_type, sizeof(int), 1, fo);
-    utils::FileStream fs(fo);
-    net_trainer->SaveModel(fs);
-    fclose(fo);
+    dmlc::Stream *fo = dmlc::Stream::Create(name, "w");
+    fo->Write(&net_type, sizeof(int));
+    net_trainer->SaveModel(*fo);
+    delete fo;
   }
   // create a neural net
   inline nnet::INetTrainer* CreateNet(void) {
     if (reset_net_type != -1) {
       net_type = reset_net_type;
     }
+    int rank = 0;
+#if MSHADOW_RABIT_PS
+    rank = rabit::GetRank();
+#endif
     nnet::INetTrainer *net;
+    if (device == "gpu:rank") {
+      std::ostringstream os;
+      os << "gpu:" << rank;
+      this->SetParam("dev", os.str().c_str());
+    }
     if (!strncmp(device.c_str(), "gpu", 3)) {
 #if MSHADOW_USE_CUDA
       net = nnet::CreateNet<mshadow::gpu>(net_type);
@@ -230,18 +282,17 @@ class CXXNetLearnTask {
         flag = 3; name_pred = val; continue;
       }
       if (!strcmp(name, "iter") && !strcmp(val, "end")) {
-        utils::Assert(flag != 0, "wrong configuration file");
+        CHECK(flag != 0) << "wrong configuration file";
         if (flag == 1 && task != "pred") {
-          utils::Assert(itr_train == NULL, "can only have one data");
+          CHECK(itr_train == NULL) << "can only have one data";
           itr_train = cxxnet::CreateIterator(itcfg);
         }
         if (flag == 2 && task != "pred") {
           itr_evals.push_back(cxxnet::CreateIterator(itcfg));
           eval_names.push_back(evname);
         }
-        if (flag == 3 && (task == "pred" || task == "pred_raw" ||
-                          task == "extract")) {
-          utils::Assert(itr_pred == NULL, "can only have one data:test");
+        if (flag == 3 && (task == "pred" || task == "extract")) {
+          CHECK(itr_pred == NULL) << "can only have one data:test";
           itr_pred = cxxnet::CreateIterator(itcfg);
         }
         flag = 0; itcfg.clear();
@@ -264,7 +315,7 @@ class CXXNetLearnTask {
   }
  private:
   inline void TaskPredict(void) {
-    utils::Assert(itr_pred != NULL, "must specify a predict iterator to generate predictions");
+    CHECK(itr_pred != NULL) << "must specify a predict iterator to generate predictions";
     printf("start predicting...\n");
     FILE *fo = utils::FopenCheck(name_pred.c_str(), "w");
     itr_pred->BeforeFirst();
@@ -272,7 +323,7 @@ class CXXNetLearnTask {
     while (itr_pred->Next()) {
       const DataBatch& batch = itr_pred->Value();
       net_trainer->Predict(&pred, batch);
-      utils::Assert(batch.num_batch_padd < batch.batch_size, "num batch pad must be smaller");
+      CHECK(batch.num_batch_padd < batch.batch_size) << "num batch pad must be smaller";
       mshadow::index_t sz = pred.size(0) - batch.num_batch_padd;
       for (mshadow::index_t j = 0; j < sz; ++j) {
         fprintf(fo, "%g\n", pred[j]);
@@ -281,9 +332,36 @@ class CXXNetLearnTask {
     fclose(fo);
     printf("finished prediction, write into %s\n", name_pred.c_str());
   }
+  inline void TaskGetWeight(void) {
+    FILE *fo = utils::FopenCheck(weight_filename.c_str(), "wb");
+    mshadow::TensorContainer<mshadow::cpu, 2> weight;
+    std::vector<index_t> shape;
+    net_trainer->GetWeight(&weight, &shape, extract_layer_name.c_str(), weight_name.c_str());
+    for (index_t i = 0; i < weight.size(0); ++i) {
+      mshadow::Tensor<mshadow::cpu, 2> d = weight[i].FlatTo2D();
+      for (index_t j = 0; j < d.size(0); ++j) {
+        if (output_format) {
+          for (index_t k = 0; k < d.size(1); ++k) {
+            fprintf(fo, "%g ", d[j].dptr_[k]);
+          }
+          fprintf(fo, "\n");
+        } else {
+          fwrite(d[j].dptr_, sizeof(float), d.size(1), fo);
+        }
+      }
+    }
+    fclose(fo);
+    std::string name_meta = weight_filename + ".meta";
+    FILE *fm = utils::FopenCheck(name_meta.c_str(), "w");
+    for (index_t i = 0; i < shape.size(); ++i) {
+      fprintf(fm, "%u ", shape[i]);
+    }
+    fclose(fm);
+    printf("finished getting weight, write into %s\n", weight_filename.c_str());
+  }
   inline void TaskExtractFeature() {
     long nrow = 0;
-    mshadow::Shape<3> dshape;
+    mshadow::Shape<3> dshape = mshadow::Shape3(0, 0, 0);
     utils::Check(itr_pred != NULL,
                  "must specify a predict iterator to generate predictions");
     printf("start predicting...\n");
@@ -302,7 +380,7 @@ class CXXNetLearnTask {
       } else {
         utils::Error("extract node name must be specified in task extract_feature.");
       }
-      utils::Assert(batch.num_batch_padd < batch.batch_size, "num batch pad must be smaller");
+      CHECK(batch.num_batch_padd < batch.batch_size) << "num batch pad must be smaller";
       mshadow::index_t sz = pred.size(0) - batch.num_batch_padd;
       nrow += sz;
       for (mshadow::index_t j = 0; j < sz; ++j) {
@@ -341,7 +419,20 @@ class CXXNetLearnTask {
     fclose(fm);
     printf("finished prediction, write into %s\n", name_pred.c_str());
   }
+
   inline void TaskTrain(void) {
+    bool is_root = true;
+    bool print_tracker = false;
+#if MSHADOW_DIST_PS
+    is_root = ::ps::MyRank() == 0;
+    silent = !is_root;
+#endif
+
+#if MSHADOW_RABIT_PS
+    is_root = rabit::GetRank() == 0;
+    print_tracker = rabit::IsDistributed();
+    silent = !is_root;
+#endif
     time_t start    = time(NULL);
     unsigned long elapsed = 0;
     if (continue_training == 0 && name_model_in == "NULL") {
@@ -351,14 +442,15 @@ class CXXNetLearnTask {
         printf("continuing from round %d", start_counter-1);
         fflush(stdout);
       }
+      std::ostringstream os;
+      os << '[' << start_counter << ']';
       for (size_t i = 0; i < itr_evals.size(); ++i) {
-        std::string res = net_trainer->Evaluate(itr_evals[i], eval_names[i].c_str());
-        fprintf(stderr, "%s", res.c_str());
+        os << net_trainer->Evaluate(itr_evals[i], eval_names[i].c_str());
       }
-      fprintf(stderr, "\n");
-      fflush(stderr);
+      os << '\n';
+      utils::TrackerPrint(os.str());
     }
-    
+
     if (itr_train != NULL) {
       if (test_io != 0) {
         printf("start I/O test\n");
@@ -378,33 +470,43 @@ class CXXNetLearnTask {
           if (++ sample_counter  % print_step == 0) {
             elapsed = (long)(time(NULL) - start);
             if (!silent) {
-              printf("\r                                                               \r");
-              printf("round %8d:[%8d] %ld sec elapsed", start_counter-1,
-                     sample_counter, elapsed);
-              fflush(stdout);
+              std::ostringstream os;
+              os << "round " << std::setw(8) << start_counter - 1
+                 << ":[" << std::setw(8) << sample_counter << "] " << elapsed << " sec elapsed";
+              if (print_tracker) {
+                utils::TrackerPrint(os.str().c_str());
+              } else {
+                printf("\r                                                               \r");
+                printf("%s", os.str().c_str());
+                fflush(stdout);
+              }
             }
           }
         }
 
         if (test_io == 0) {
-          // code handling evaluation
-          fprintf(stderr, "[%d]", start_counter);
+          std::ostringstream os;
+          if (silent) {
+            os << "Finish " << sample_counter << " epochs in "
+               << (long)(time(NULL) - start) << " sec. ";
+          }
+          os << '[' << start_counter << ']';
           // handle only with eval_train = 1, but not val data
           if (itr_evals.size() == 0) {
-            std::string res = net_trainer->Evaluate(NULL, "train");
-            fprintf(stderr, "%s", res.c_str());
+            os << net_trainer->Evaluate(NULL, "train");
           }
           for (size_t i = 0; i < itr_evals.size(); ++i) {
-            std::string res = net_trainer->Evaluate(itr_evals[i], eval_names[i].c_str());
-            fprintf(stderr, "%s", res.c_str());
+            os << net_trainer->Evaluate(itr_evals[i], eval_names[i].c_str());
           }
-          fprintf(stderr, "\n");
-          fflush(stderr);
+          os << '\n';
+          utils::TrackerPrint(os.str());
         }
         elapsed = (unsigned long)(time(NULL) - start);
-        this->SaveModel();
+        if (is_root) {
+          this->SaveModel();
+        }
       }
-      
+
       if (!silent) {
         printf("\nupdating end, %lu sec in all\n", elapsed);
       }
@@ -412,12 +514,12 @@ class CXXNetLearnTask {
   }
 
   inline void CopyModel(void){
-    FILE *fi = utils::FopenCheck(name_model_in.c_str(), "rb");
-    utils::Assert(fread(&net_type, sizeof(int), 1, fi) > 0, "loading model");
+    dmlc::Stream *fi = dmlc::Stream::Create(name_model_in.c_str(), "r");
+    CHECK(fi->Read(&net_type, sizeof(int)) != 0) << " invalid model file";
     net_trainer = this->CreateNet();
-    utils::FileStream fs(fi);
-    net_trainer->CopyModelFrom(fs);
-    fclose(fi);
+    net_trainer->CopyModelFrom(*fi);
+    start_counter = 1;
+    delete fi;
   }
  private:
   /*! \brief type of net implementation */
@@ -468,6 +570,12 @@ class CXXNetLearnTask {
   std::string extract_node_name;
   /*! \brief output format of network */
   int output_format;
+  /*! \brief the layer name for weight extraction */
+  std::string extract_layer_name;
+  /*! \brief the output filename of the extracted weight */
+  std::string weight_filename;
+  /*! \brief wmat of bias */
+  std::string weight_name;
  };
 }  // namespace cxxnet
 

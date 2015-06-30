@@ -7,12 +7,16 @@
  */
 #include "data.h"
 #include <cstdlib>
-#include <omp.h>
+#include <dmlc/logging.h>
 #include "../utils/thread_buffer.h"
 #include "../utils/utils.h"
 #include "../utils/decoder.h"
 #include "../utils/random.h"
+#if MSHADOW_DIST_PS
+#include "ps.h"
+#endif
 
+// #include "glog/logging.h"
 namespace cxxnet {
 /*! \brief thread buffer iterator */
 class ThreadImagePageIteratorX: public IIterator<DataInst> {
@@ -107,11 +111,13 @@ public:
   std::string raw_imglst_, raw_imgbin_;
   /*! \brief parse configure file */
   inline void ParseImageConf(void) {
-    // handling for hadoop
-    const char *ps_rank = getenv("PS_RANK");
-    if (ps_rank != NULL) {
-      this->SetParam("dist_worker_rank", ps_rank);
-    }
+
+#if MSHADOW_DIST_PS
+    // TODO move to a better place
+    dist_num_worker_ = ::ps::RankSize();
+    dist_worker_rank_ = ::ps::MyRank();
+#endif
+
     if (img_conf_prefix_.length() == 0) return;
     utils::Check(path_imglst_.size() == 0 &&
                  path_imgbin_.size() == 0,
@@ -136,6 +142,10 @@ public:
       tmp.resize(strlen(tmp.c_str()));
       path_imglst_.push_back(tmp + ".lst");
       path_imgbin_.push_back(tmp + ".bin");
+
+#if MSHADOW_DIST_PS
+      std::cout << "rank " << dist_worker_rank_ << ": " << tmp << std::endl;
+#endif
     }
   }
 
@@ -218,7 +228,7 @@ private:
                            label_width, j);
 
             }
-            utils::Assert(fscanf(fplist, "%*[^\n]\n") == 0, "ignore");
+            CHECK(fscanf(fplist, "%*[^\n]\n") == 0) << "ignore";
           }
           return true;
         } else {

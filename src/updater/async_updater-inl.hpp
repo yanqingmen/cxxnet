@@ -5,10 +5,11 @@
  * \brief implementation of asynchronize updater using SGD
  * \author Tianqi Chen
  */
+#include <dmlc/logging.h>
 #include <mshadow/tensor.h>
-#include <mshadow-ps/ps.h>
+#include <dmlc/timer.h>
 #include "./updater.h"
-#include "../utils/timer.h"
+
 namespace cxxnet {
 namespace updater {
 template<typename xpu>
@@ -73,7 +74,7 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
       mshadow::Tensor<xpu, 2> in = nodes_in[0]->mat();
       mshadow::Tensor<xpu, 2> out = nodes_out[0]->mat();
       num_in = in.size(1); num_out = out.size(1);
-      tnode.Resize(mshadow::Shape2(total_batch_size, num_in + num_out));      
+      tnode.Resize(mshadow::Shape2(total_batch_size, num_in + num_out));
       // manually hslice
       mshadow::Tensor<xpu, 2> tin(tnode.dptr_,
                                   mshadow::Shape2(total_batch_size, num_in),
@@ -88,7 +89,7 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
                    "when you use fullc_gather mode, the batch_size "\
                    "must be multiple of number of devices");
       mshadow::Copy(tin.Slice(0, local_batch_size), in, tnode.stream_);
-      mshadow::Copy(tout.Slice(0, local_batch_size), out, tnode.stream_);      
+      mshadow::Copy(tout.Slice(0, local_batch_size), out, tnode.stream_);
     }
   }
   virtual void AfterBackprop(bool do_update, long epoch) {
@@ -100,7 +101,7 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
         this->update_epoch = epoch;
         pserver->Push(dw, data_key, devid, priority);
         if (update_on_server == 0) {
-          if (pull_at_backprop != 0) {          
+          if (pull_at_backprop != 0) {
             pserver->PullReq(dw, data_key, devid, priority,
                              ApplyUpdate_, this);
           } else {
@@ -125,9 +126,9 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
                        ApplyGatherUpdate_, this);
     }
   }
-  virtual void BeforeForward(void) {
+  virtual void BeforeAllForward(void) {
     if (pull_not_issued) {
-      if (update_on_server == 0) { 
+      if (update_on_server == 0) {
         pserver->PullReq(dw, data_key, devid, priority,
                          ApplyUpdate_, this);
       } else {
@@ -146,8 +147,8 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
       updater->StartRound(round);
     }
     if (test_on_server != 0) {
-      utils::Assert(update_on_server == 0,
-                    "test_on_server must set update_on_server = 0");
+      CHECK(update_on_server == 0)
+          << "test_on_server must set update_on_server = 0";
       pserver->PullWait(data_key, devid);
       pserver->CheckWeight_(w.FlatTo2D(), data_key, devid);
     }
@@ -198,8 +199,8 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
     dw += dot(tout.T(), tin);
   }
   inline static void CleanGrad_(mshadow::Stream<xpu> *stream, void *arg) {
-    AsyncUpdater<xpu> *up = static_cast<AsyncUpdater<xpu>*>(arg);    
-    utils::Assert(up->update_on_server !=0, "update_on_server consistency");
+    AsyncUpdater<xpu> *up = static_cast<AsyncUpdater<xpu>*>(arg);
+    CHECK(up->update_on_server != 0) << "update_on_server consistency";
     up->dw.set_stream(stream);
     up->dw = 0.0f;
   }
@@ -209,8 +210,8 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
       up->updater->SetStream(stream);
       up->updater->Update(up->update_epoch);
     }
-  }  
-  inline static void ApplyGatherUpdate_(mshadow::Stream<xpu> *stream, void *arg) {    
+  }
+  inline static void ApplyGatherUpdate_(mshadow::Stream<xpu> *stream, void *arg) {
     AsyncUpdater<xpu> *up = static_cast<AsyncUpdater<xpu>*>(arg);
     utils::Check(up->update_on_server == 0, "GatherUpdate can not use update_on_server");
     up->CalcDelta(stream);
@@ -247,8 +248,8 @@ class AsyncUpdater: public IAsyncUpdater<xpu> {
   index_t num_in, num_out;
   // the total batch_size across nodes
   index_t local_batch_size, total_batch_size;
-  // temporal result 
-  mshadow::TensorContainer<xpu, 2> tnode; 
+  // temporal result
+  mshadow::TensorContainer<xpu, 2> tnode;
 };
 }  // updater
 }  // cxxnet

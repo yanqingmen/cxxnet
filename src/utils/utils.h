@@ -9,53 +9,20 @@
 #include <cstdio>
 #include <string>
 #include <cstdlib>
-#include <vector>
 #include <cstdarg>
-
-#if !defined(__GNUC__)
-#define fopen64 std::fopen
-#endif
-#ifdef _MSC_VER
-// NOTE: sprintf_s is not equivalent to snprintf,
-// they are equivalent when success, which is sufficient for our case
-#define snprintf sprintf_s
-#define vsnprintf vsprintf_s
-#else
-#ifdef _FILE_OFFSET_BITS
-#if _FILE_OFFSET_BITS == 32
-#pragma message ("Warning: FILE OFFSET BITS defined to be 32 bit")
-#endif
+#include <dmlc/base.h>
+#include <dmlc/logging.h>
+#if MSHADOW_RABIT_PS
+#include <rabit.h>
 #endif
 
-#ifdef __APPLE__
-#define off64_t off_t
-#define fopen64 std::fopen
-#endif
-
-extern "C" {
-#include <sys/types.h>
-}
-#endif
-
-#ifdef _MSC_VER
-typedef unsigned char uint8_t;
-typedef unsigned short int uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long uint64_t;
-typedef long int64_t;
-#else
-#include <inttypes.h>
-#endif
-
-#ifndef CHECK
-#define CHECK(ARGS) cxxnet::utils::Check(ARGS, "Assert Error at %s: %d", __FILE__, __LINE__);
-#endif
 #define CUDA_CHECK(ARGS) CHECK(ARGS==0);
 
 namespace cxxnet {
+/*! \brief include dmlc objects in cxxnet interface */
+using namespace dmlc;
 /*! \brief namespace for helper utils of the project */
 namespace utils {
-
 /*! \brief error message buffer length */
 const int kPrintBuffer = 1 << 12;
 
@@ -104,18 +71,6 @@ inline int SPrintf(char *buf, size_t size, const char *fmt, ...) {
   return ret;
 }
 
-/*! \brief assert an condition is true, use this to handle debug information */
-inline void Assert(bool exp, const char *fmt, ...) {
-  if (!exp) {
-    std::string msg(kPrintBuffer, '\0');
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(&msg[0], kPrintBuffer, fmt, args);
-    va_end(args);
-    HandleAssertError(msg.c_str());
-  }
-}
-
 /*!\brief same as assert, but this is intended to be used as message for user*/
 inline void Check(bool exp, const char *fmt, ...) {
   if (!exp) {
@@ -146,25 +101,29 @@ inline std::FILE *FopenCheck(const char *fname, const char *flag) {
   Check(fp != NULL, "can not open file \"%s\"\n", fname);
   return fp;
 }
+// print message to tracker
+inline void TrackerPrint(const std::string msg, bool root_only = true) {
+#if MSHADOW_RABIT_PS
+  if (!root_only || rabit::GetRank() == 0) {
+    rabit::TrackerPrint(msg);
+  }
+#else
+  fprintf(stderr, "%s", msg.c_str());
+  fflush(stderr);
+#endif
+}
+
+/*! \brief portable version of snprintf */
+inline void TrackerPrintf(const char *fmt, ...) {
+  const int kPrintBuffer = 1 << 10;
+  std::string msg(kPrintBuffer, '\0');
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(&msg[0], kPrintBuffer, fmt, args);
+  va_end(args);
+  msg.resize(strlen(msg.c_str()));
+  TrackerPrint(msg);
+}
 }  // namespace utils
-// easy utils that can be directly acessed in xgboost
-/*! \brief get the beginning address of a vector */
-template<typename T>
-inline T *BeginPtr(std::vector<T> &vec) {
-  if (vec.size() == 0) {
-    return NULL;
-  } else {
-    return &vec[0];
-  }
-}
-/*! \brief get the beginning address of a vector */
-template<typename T>
-inline const T *BeginPtr(const std::vector<T> &vec) {
-  if (vec.size() == 0) {
-    return NULL;
-  } else {
-    return &vec[0];
-  }
-}
 }  // namespace cxxnet
 #endif  // CXXNET_UTILS_UTILS_H_

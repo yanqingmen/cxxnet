@@ -2,9 +2,12 @@
 #define CXXNET_UTILS_DECODER_H_
 
 #include <vector>
-#include <jpeglib.h>
-#include <setjmp.h>
-#include <jerror.h>
+#if CXXNET_USE_OPENCV_DECODER == 0
+  #include <jpeglib.h>
+  #include <setjmp.h>
+  #include <jerror.h>
+#endif
+#include <dmlc/logging.h>
 #include <mshadow/tensor.h>
 #include "./utils.h"
 #if CXXNET_USE_OPENCV
@@ -14,6 +17,7 @@
 namespace cxxnet {
 namespace utils {
 
+#if CXXNET_USE_OPENCV_DECODER == 0
 struct JpegDecoder {
 public:
   JpegDecoder(void) {
@@ -67,7 +71,7 @@ private:
     size_t num_bytes = static_cast<size_t>(num_bytes_);
     if (num_bytes > 0) {
       src->next_input_byte += num_bytes;
-      utils::Assert(src->bytes_in_buffer >= num_bytes, "fail to decode");
+      CHECK(src->bytes_in_buffer >= num_bytes) << "fail to decode";
       src->bytes_in_buffer -= num_bytes;
     } else {
       utils::Error("JpegDecoder: bad jpeg image");
@@ -97,13 +101,14 @@ private:
   jpeg_source_mgr src;
   jerror_mgr jerr;
 };
+#endif
 
 #if CXXNET_USE_OPENCV
 struct OpenCVDecoder {
   void Decode(unsigned char *ptr, size_t sz, mshadow::TensorContainer<cpu, 3, unsigned char> *p_data) {
     cv::Mat buf(1, sz, CV_8U, ptr);
     cv::Mat res = cv::imdecode(buf, 1);
-    utils::Assert(res.data != NULL, "decoding fail");
+    CHECK(res.data != NULL) << "decoding fail";
     p_data->Resize(mshadow::Shape3(res.rows, res.cols, 3));
     for (int y = 0; y < res.rows; ++y) {
       for (int x = 0; x < res.cols; ++x) {

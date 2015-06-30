@@ -12,3 +12,9 @@ layer_impl-inl.hpp
 *.so
 im2bin
 *.pyc
+example
+*.log
+ps-lite
+dmlc-core
+bin
+rabit

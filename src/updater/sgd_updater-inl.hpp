@@ -5,8 +5,10 @@
  * \brief implementation of SGD with momentum
  * \author Tianqi Chen
  */
+#include <dmlc/logging.h>
 #include <mshadow/tensor.h>
- #include "./updater.h"
+#include <cmath>
+#include "./updater.h"
 #include "./param.h"
 
 namespace cxxnet {
@@ -32,7 +34,7 @@ class SGDUpdater : public IUpdater<xpu> {
   virtual ~SGDUpdater(void) {}
   virtual void Init(void) {
     if (param.silent == 0) {
-      printf("SGDUpdater: eta=%f, mom=%f\n", param.base_lr_, param.momentum);
+      utils::TrackerPrintf("SGDUpdater: eta=%f, mom=%f\n", param.base_lr_, param.momentum);
     }
     m_w.Resize(w.shape_, 0.0f);
   }
@@ -48,8 +50,8 @@ class SGDUpdater : public IUpdater<xpu> {
     dw = 0.0f;
   }
   virtual void Update(long epoch, mshadow::Tensor<xpu, 2> grad) {
-    utils::Assert(grad.shape_ == w.shape_.FlatTo2D(),
-                  "SGDUpdater: grad must be generated from source of same shape");
+    CHECK(grad.shape_ == w.shape_.FlatTo2D())
+        << "SGDUpdater: grad must be generated from source of same shape";
     this->ApplyUpdate(epoch, mshadow::Tensor<xpu, dim>
                       (grad.dptr_, w.shape_, grad.stride_, w.stream_));
   }
@@ -86,4 +88,3 @@ class SGDUpdater : public IUpdater<xpu> {
 }  // namespace updater
 }  // namespace cxxnet
 #endif
-

@@ -5,9 +5,10 @@
  * \brief iterator that takes mnist dataset
  * \author Tianqi Chen
  */
+#include "./data.h"
 #include <mshadow/tensor.h>
-#include "data.h"
-#include "../utils/io.h"
+#include <dmlc/io.h>
+#include <dmlc/logging.h>
 #include "../utils/random.h"
 
 namespace cxxnet {
@@ -20,7 +21,7 @@ class MNISTIterator: public IIterator<DataBatch> {
     silent_ = 0;
     shuffle_ = 0;
     rnd.Seed(kRandMagic);
-  }  
+  }
   virtual ~MNISTIterator(void) {
     if (img_.dptr_ != NULL) delete []img_.dptr_;
   }
@@ -75,11 +76,12 @@ class MNISTIterator: public IIterator<DataBatch> {
   }
  private:
   inline void LoadImage(void) {
-    utils::GzFile gzimg(path_img.c_str(), "rb");
-    ReadInt(gzimg);
-    int image_count = ReadInt(gzimg);
-    int image_rows  = ReadInt(gzimg);
-    int image_cols  = ReadInt(gzimg);
+    
+    dmlc::Stream *stdimg = dmlc::Stream::Create(path_img.c_str(), "r");
+    ReadInt(stdimg);
+    int image_count = ReadInt(stdimg);
+    int image_rows  = ReadInt(stdimg);
+    int image_cols  = ReadInt(stdimg);
 
     img_.shape_ = mshadow::Shape3(image_count, image_rows, image_cols);
     img_.stride_ = img_.size(2);
@@ -89,23 +91,29 @@ class MNISTIterator: public IIterator<DataBatch> {
     for (int i = 0; i < image_count; ++i) {
       for (int j = 0; j < image_rows; ++j) {
         for (int k = 0; k < image_cols; ++k) {
-          img_[i][j][k] = gzimg.ReadType<unsigned char>();
+          unsigned char ch;
+          CHECK(stdimg->Read(&ch, sizeof(ch) != 0));
+          img_[i][j][k] = ch;
         }
       }
     }
     // normalize to 0-1
     img_ *= 1.0f / 256.0f;
+    delete stdimg;
   }
   inline void LoadLabel(void) {
-    utils::GzFile gzlabel(path_label.c_str(), "rb");
-    ReadInt(gzlabel);
-    int labels_count =ReadInt(gzlabel);
+    dmlc::Stream *stdlabel = dmlc::Stream::Create(path_label.c_str(), "r");
+    ReadInt(stdlabel);
+    int labels_count =ReadInt(stdlabel);
 
     labels_.resize(labels_count);
     for (int i = 0; i < labels_count; ++i) {
-      labels_[i] = gzlabel.ReadType<unsigned char>();
+      unsigned char ch;
+      CHECK(stdlabel->Read(&ch, sizeof(ch) != 0));
+      labels_[i] = ch;
       inst_.push_back((unsigned)i + inst_offset_);
     }
+    delete stdlabel;
   }
   inline void Shuffle(void) {
     rnd.Shuffle(inst_);
@@ -121,9 +129,10 @@ class MNISTIterator: public IIterator<DataBatch> {
     labels_ = tmplabel;
   }
  private:
-  inline static int ReadInt(utils::IStream &fi) {
+  inline static int ReadInt(dmlc::Stream *fi) {
     unsigned char buf[4];
-    utils::Assert(fi.Read(buf, sizeof(buf)) == sizeof(buf), "Failed to read an int\n");
+    CHECK(fi->Read(buf, sizeof(buf)) == sizeof(buf))
+        << "invalid mnist format";
     return int(buf[0] << 24 | buf[1] << 16 | buf[2] << 8 | buf[3]);
   }
  private:

@@ -12,6 +12,11 @@
 #include <sstream>
 #include "./random.h"
 #include "../layer/layer.h"
+
+#if MSHADOW_RABIT_PS
+#include <rabit.h>
+#endif
+
 namespace cxxnet {
 namespace utils {
 
@@ -30,7 +35,8 @@ class IMetric{
    * \param labels label
    * \param n number of instances
    */
-  virtual void AddEval(const mshadow::Tensor<cpu,2> &predscore, const LabelRecord& labels) = 0;
+  virtual void AddEval(const mshadow::Tensor<cpu,2> &predscore,
+                       const LabelRecord& labels) = 0;
   /*! \brief get current result */
   virtual double Get(void) const = 0;
   /*! \return name of metric */
@@ -38,22 +44,29 @@ class IMetric{
 };
 
 /*! \brief simple metric Base */
-struct MetricBase : public IMetric{
+struct MetricBase : public IMetric {
  public:
   virtual ~MetricBase(void) {}
   virtual void Clear(void) {
     sum_metric = 0.0; cnt_inst = 0;
   }
-  virtual void AddEval(const mshadow::Tensor<cpu,2> &predscore, const LabelRecord& labels) {
+  virtual void AddEval(const mshadow::Tensor<cpu,2> &predscore,
+                       const LabelRecord& labels) {
     for (index_t i = 0; i < predscore.size(0); ++ i) {
       sum_metric += CalcMetric(predscore[i], labels.label[i]);
       cnt_inst+= 1;
     }
   }
-  virtual double Get(void) const{
-    return sum_metric / cnt_inst;
+  virtual double Get(void) const {
+    double tmp[2];
+    tmp[0] = sum_metric;
+    tmp[1] = static_cast<double>(cnt_inst);
+#if MSHADOW_RABIT_PS    
+    rabit::Allreduce<rabit::op::Sum>(tmp, 2);
+#endif    
+    return tmp[0] / tmp[1];
   }
-  virtual const char *Name(void) const{
+  virtual const char *Name(void) const {
     return name.c_str();
   }
  protected:
@@ -62,7 +75,7 @@ struct MetricBase : public IMetric{
     this->Clear();
   }
   virtual float CalcMetric(const mshadow::Tensor<cpu,1> &predscore,
-    const mshadow::Tensor<cpu,1> &label) = 0;
+                           const mshadow::Tensor<cpu,1> &label) = 0;
  private:
   double sum_metric;
   long   cnt_inst;
@@ -72,14 +85,14 @@ struct MetricBase : public IMetric{
 /*! \brief RMSE */
 struct MetricRMSE : public MetricBase{
  public:
-  MetricRMSE(void):MetricBase("rmse") {
+  MetricRMSE(void) : MetricBase("rmse") {
   }
   virtual ~MetricRMSE(void) {}
  protected:
   virtual float CalcMetric(const mshadow::Tensor<cpu,1> &predscore,
-    const mshadow::Tensor<cpu,1> &label) {
+                           const mshadow::Tensor<cpu,1> &label) {
     utils::Check(predscore.size(0) == label.size(0),
-      "Metric: In RMSE metric, the size of prediction and label must be same.");
+                 "Metric: In RMSE metric, the size of prediction and label must be same.");
     float diff = 0;
     for (index_t i = 0; i < label.size(0); ++i) {
       diff += (predscore[i] - label[i]) * (predscore[i] - label[i]);
@@ -91,58 +104,79 @@ struct MetricRMSE : public MetricBase{
 /*! \brief Error */
 struct MetricError : public MetricBase{
  public:
-  MetricError(void):MetricBase("error") {
+  MetricError(void) : MetricBase("error") {
   }
   virtual ~MetricError(void) {}
  protected:
   virtual float CalcMetric(const mshadow::Tensor<cpu,1> &pred,
     const mshadow::Tensor<cpu,1> &label) {
-    index_t maxidx = 0;
-    if (pred.size(0) != 1) {
-      for (index_t i = 1; i < pred.size(0); ++ i) {
-        if (pred[i] > pred[maxidx]) maxidx = i;
+    int count = 0;
+    if (label.size(0) != 1) {
+      utils::Check(pred.size(0) == label.size(0),
+                 "Metric: In error metric, if label_width is not 1, then pred and label must be of same length.");
+      for (index_t j = 0; j < label.size(0); ++j) {
+        index_t maxidx = 0;
+        maxidx = pred[j] > 0.0 ? 1 : 0;
+        count += (maxidx !=(index_t)label[j]);
       }
-    }else{
-      maxidx = pred[0] > 0.0 ? 1 : 0;
+      return (float)count / label.size(0);
+    } else {
+      index_t maxidx = 0;
+      if (pred.size(0) != 1) {
+        for (index_t i = 1; i < pred.size(0); ++ i) {
+          if (pred[i] > pred[maxidx]) maxidx = i;
+        }
+      } else {
+        maxidx = pred[0] > 0.0 ? 1 : 0;
+      }
+      return (maxidx !=(index_t)label[0]);
     }
-    return maxidx !=(index_t)label[0];
   }
 };
 
 /*! \brief Logloss */
 struct MetricLogloss : public MetricBase{
  public:
-  MetricLogloss(void):MetricBase("logloss") {
+  MetricLogloss(void) : MetricBase("logloss") {
   }
   virtual ~MetricLogloss(void) {}
  protected:
   virtual float CalcMetric(const mshadow::Tensor<cpu,1> &pred,
     const mshadow::Tensor<cpu,1> &label) {
-    int target = static_cast<int>(label[0]);
-    if (pred.size(0) != 1) {
-      return - std::log(std::max(std::min(pred[target], 1.0f - 1e-15f), 1e-15f));
-    }else{
-      const float py = std::max(std::min(pred[0], 1.0f - 1e-15f), 1e-15f);
-      const float y = label[0];
-      const float res = - (y * std::log(py) + (1.0f - y)*std::log(1 - py));
-      utils::Check(res == res, "NaN detected!");
-      return res;
+    if (label.size(0) != 1) {
+      utils::Check(pred.size(0) == label.size(0),
+                 "Metric: In logloss metric, if label_width is not 1, then pred and label must be of same length.");
+      float ret = 0;
+      for (index_t j = 0; j < label.size(0); ++j) {
+        int target = static_cast<int>(label[j]);
+        const float py = std::max(std::min(pred[j], 1.0f - 1e-15f), 1e-15f);
+        ret -= (target * std::log(py) + (1.0f - target)*std::log(1 - py));
+      }
+      return ret / label.size(0);  
+    } else {
+      int target = static_cast<int>(label[0]);
+      if (pred.size(0) != 1) {
+        return -std::log(std::max(std::min(pred[target], 1.0f - 1e-15f), 1e-15f));
+      } else {
+        const float py = std::max(std::min(pred[0], 1.0f - 1e-15f), 1e-15f);
+        return -((target * std::log(py) + (1.0f - target)*std::log(1 - py)));
+      }
     }
   }
 };
 
 /*! \brief Recall@n */
-struct MetricRecall : public MetricBase{
+struct MetricRecall : public MetricBase {
  public:
-  MetricRecall(const char *name): MetricBase(name) {
-    utils::Assert(sscanf(name, "rec@%d", &topn) == 1, "must specify n for rec@n");
+  MetricRecall(const char *name) : MetricBase(name) {
+    CHECK(sscanf(name, "rec@%d", &topn) == 1) << "must specify n for rec@n";
   }
   virtual ~MetricRecall(void) {}
  protected:
   virtual float CalcMetric(const mshadow::Tensor<cpu,1> &pred,
-    const mshadow::Tensor<cpu,1> &label) {
+                           const mshadow::Tensor<cpu,1> &label) {
     utils::Check(pred.size(0) >= (index_t)topn,
-      "it is meaningless to take rec@n for list shorter than n, evaluating rec@%d, list=%u\n",
+                 "it is meaningless to take rec@n for list shorter than n, evaluating rec@%d, list=%u\n",
       topn, pred.size(0));
     vec.resize(pred.size(0));
     for (index_t i = 0; i < pred.size(0); ++ i) {
@@ -162,7 +196,8 @@ struct MetricRecall : public MetricBase{
     return (float)hit / label.size(0);
   }
  private:
-  inline static bool CmpScore(const std::pair<float,index_t> &a, const std::pair<float,index_t> &b) {
+  inline static bool CmpScore(const std::pair<float,index_t> &a,
+                              const std::pair<float,index_t> &b) {
     return a.first > b.first;
   }
 
@@ -202,8 +237,8 @@ struct MetricSet{
   }
   inline void AddEval(const std::vector<mshadow::Tensor<cpu, 2> >& predscores,
     const layer::LabelInfo& labels) {
-    utils::Assert(predscores.size() == evals_.size(),
-      "Metric: Number of predict scores and number of metrics should be equal.");
+    CHECK(predscores.size() == evals_.size())
+        << "Metric: Number of predict scores and number of metrics should be equal.";
     for (size_t i = 0; i < evals_.size(); ++ i) {
       std::map<std::string, size_t>::const_iterator it =
         labels.name2findex->find(label_fields_[i]);

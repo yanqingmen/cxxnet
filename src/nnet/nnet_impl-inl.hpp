@@ -8,6 +8,12 @@
 #include "../utils/metric.h"
 #include "./neural_net-inl.hpp"
 
+#if MSHADOW_DIST_PS
+#include "gflags/gflags.h"
+namespace ps {
+DECLARE_bool(local);
+} // namespace ps
+#endif
 
 namespace cxxnet {
 namespace nnet {
@@ -22,6 +28,7 @@ class CXXNetThreadTrainer : public INetTrainer {
     eval_train = 1;
     epoch_counter = 0;
     seed = 0;
+    silent = 0;
     pserver = NULL;
     type_pserver = "UNSPECIFIED";
   }
@@ -48,6 +55,15 @@ class CXXNetThreadTrainer : public INetTrainer {
           }
         }
       }
+#if MSHADOW_DIST_PS
+      if (::ps::FLAGS_local && ::ps::RankSize() > 1 && devices_.size()) {
+        // running multiple workers on the same machine
+        CHECK_GE(devices_.size(), ::ps::RankSize());
+        int dev = devices_[::ps::MyRank()];
+        devices_.clear();
+        devices_.push_back(dev);
+      }
+#endif
     }
     if (!strcmp(name, "batch_size")) batch_size = static_cast<mshadow::index_t>(atoi(val));
     if (!strcmp(name, "update_period")) update_period = atoi(val);
@@ -111,7 +127,7 @@ class CXXNetThreadTrainer : public INetTrainer {
     std::string old_model;
     fi.Read(&old_model);
     utils::MemoryBufferStream os(&old_model);
-    old_net.LoadModel(os);
+    old_net.LoadModel(os, false);
 
     // Compare original net and current net
     for (index_t i = 0; i < old_cfg.layers.size(); ++i){
@@ -144,7 +160,8 @@ class CXXNetThreadTrainer : public INetTrainer {
     out_temp.Resize(oshape);
 
     const size_t ndevice = devices_.size();
-    mshadow::index_t step = std::max((batch_size + ndevice - 1) / ndevice, 1UL);
+    mshadow::index_t step = std::max(static_cast<mshadow::index_t>((batch_size + ndevice - 1) / ndevice), \
+                                     static_cast<mshadow::index_t>(1UL));
 
     bool need_sync = sample_counter % update_period == 0;
     bool need_update = (sample_counter + 1) % update_period == 0;
@@ -222,25 +239,39 @@ class CXXNetThreadTrainer : public INetTrainer {
     *out_preds = req[0].second;
   }
   virtual std::string Evaluate(IIterator<DataBatch> *iter_eval, const char *data_name) {
+    // explicitly sync parameters
+    for (size_t i = 0; i < nets_.size(); ++i) {
+      nets_[i]->SyncParam();
+    }
+    this->WaitAllJobs();
+    // safe guard for safely use allreduce in eval
+    if (pserver != NULL) {
+      pserver->SetParam("msg:disable_allreduce", "1");
+    }    
     std::string ret;
     if (eval_train != 0) {
       ret += train_metric.Print("train");
       train_metric.Clear();
     }
-    if (iter_eval == NULL) return ret;
-    metric.Clear();
-    iter_eval->BeforeFirst();
-    while (iter_eval->Next()) {
-      const DataBatch& batch = iter_eval->Value();
-      this->ForwardTo(eval_req, batch);
-      std::vector<mshadow::Tensor<cpu, 2> > scores;
-      for (index_t i = 0; i < eval_req.size(); ++i) {
-        scores.push_back(eval_req[i].second.Slice(
-          0, eval_req[i].second.size(0) - batch.num_batch_padd).FlatTo2D());
+    if (iter_eval != NULL) {
+      metric.Clear();
+      iter_eval->BeforeFirst();
+      while (iter_eval->Next()) {
+        const DataBatch& batch = iter_eval->Value();
+        this->ForwardTo(eval_req, batch);
+        std::vector<mshadow::Tensor<cpu, 2> > scores;
+        for (index_t i = 0; i < eval_req.size(); ++i) {
+          scores.push_back(eval_req[i].second.Slice(
+              0, eval_req[i].second.size(0) - batch.num_batch_padd).FlatTo2D());
+        }
+        metric.AddEval(scores, GetLabelInfo(batch));
       }
-      metric.AddEval(scores, GetLabelInfo(batch));
+      ret += metric.Print(data_name);
     }
-    ret += metric.Print(data_name);
+    // rabit related code for safe guard
+    if (pserver != NULL) {
+      pserver->SetParam("msg:disable_allreduce", "0");
+    }
     return ret;
   }
   virtual void SetWeight(mshadow::Tensor<mshadow::cpu, 2> weight,
@@ -301,7 +332,8 @@ class CXXNetThreadTrainer : public INetTrainer {
                         const DataBatch &data) {
     this->InitEvalReq(req);
     const size_t ndevice = devices_.size();
-    mshadow::index_t step = std::max((batch_size + ndevice - 1) / ndevice, 1UL);
+    mshadow::index_t step = std::max(static_cast<mshadow::index_t>((batch_size + ndevice - 1) / ndevice), \
+                                     static_cast<mshadow::index_t>(1UL));
     for (mshadow::index_t i = nets_.size(); i != 0; --i) {
       mshadow::index_t begin = std::min((i - 1) * step, data.batch_size);
       mshadow::index_t end = std::min(i * step, data.batch_size);
@@ -337,11 +369,12 @@ class CXXNetThreadTrainer : public INetTrainer {
     nets_[0]->WaitJob();
   }
   inline void InitNet(void) {
-    utils::Assert(nets_.size() == 0, "net must be empty before this");
+    CHECK(nets_.size() == 0) << "net must be empty before this";
     net_cfg.Configure(cfg);
     if (devices_.size() == 0) devices_.push_back(0);
     size_t ndevice = devices_.size();
-    mshadow::index_t step = std::max((batch_size + ndevice - 1) / ndevice, 1UL);
+    mshadow::index_t step = std::max(static_cast<mshadow::index_t>((batch_size + ndevice - 1) / ndevice), \
+                                     static_cast<mshadow::index_t>((1UL)));
     while (step * (devices_.size() - 1) >= batch_size) {
       devices_.pop_back();
     }
@@ -374,7 +407,7 @@ class CXXNetThreadTrainer : public INetTrainer {
     }
   }
   inline void InitParamServer(void) {
-    utils::Assert(pserver == NULL, "net must be empty before this");
+    CHECK(pserver == NULL) << "net must be empty before this";
     if (type_pserver == "UNSPECIFIED") {
       if (devices_.size() <=1) type_pserver = "NONE";
       else type_pserver = "local";
@@ -417,7 +450,7 @@ class CXXNetThreadTrainer : public INetTrainer {
   /*! \brief type of parameter server */
   std::string type_pserver;
   /*! \brief epoch counter */
-  long epoch_counter;
+  uint64_t epoch_counter;
   /*! \brief seed to the layers */
   int seed;
   /*! \brief silent*/
