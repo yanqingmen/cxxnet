@@ -313,6 +313,8 @@ const int kPRelu = 29;
 const int kBatchNorm = 30;
 const int kFixConnect = 31;
 const int kBatchNorm_no_ma = 32;
+//simple rnn layer
+const int kSRNN = 55;
 /*! \brief gap used to encode pairtest layer */
 const int kPairTestGap = 1024;
 /*! \brief use integer to encode layer types */
@@ -352,6 +354,7 @@ inline LayerType GetLayerType(const char *type) {
   if (!strcmp(type, "prelu")) return kPRelu;
   if (!strcmp(type, "batch_norm")) return kBatchNorm;
   if (!strcmp(type, "batch_norm_no_ma")) return kBatchNorm_no_ma;
+  if(!strcmp(type, "simple_rnn")) return kSRNN;
   #if CXXNET_USE_CAFFE_ADAPTOR
   if (!strcmp(type, "caffe")) return kCaffe;
   #endif

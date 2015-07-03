@@ -47,7 +47,7 @@ param['dev'] = 'cpu'
 param['momentum'] = 0.9
 param['metric[label]'] = 'error'
 
-net = cxxnet.train(cfg, data, 1, param, eval_data = deval)
+net = cxxnet.train(cfg, data, None, 10, param, eval_data = deval)
 
 weights = []
 for layer in ['fc1', 'fc2']:

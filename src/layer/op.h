@@ -100,6 +100,16 @@ struct square_root {
   }
 };
 
+/*! \brief used for gradient clipping and nan detection */
+struct clip {
+  MSHADOW_XINLINE static real_t Map(real_t a, real_t b) {
+    if (isnan(a)) return 0.0f;
+    if (a < -b) return -b;
+    if (a > b) return b;
+    return a;
+  }
+};
+
 }  // namespace op
 }  // namespace cxxnet
 #endif // CXXNET_LAYER_OP_H
