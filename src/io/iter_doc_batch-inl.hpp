@@ -71,7 +71,7 @@ public:
       for (index_t i = 0; i< batch_size; ++i) {
         loc[i] = 0;
       }
-      return false;
+      return true;
     }
     return true;
   }
